@@ -1,0 +1,25 @@
+[package]
+name = "steam_api"
+version = "0.1.0"
+authors = ["Nicholas McDaniel <nickmcdaniel00@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Steam WebApi requests
+reqwest = { version = "0.10.4", features = [ "blocking", "json" ] }
+
+# Constants
+lazy_static = "1.4.0"
+
+# Decoding WebApi results
+serde_json = "1.0.53"
+serde = { version = "1.0.53", features = [ "derive" ] }
+
+# SessionKey generation
+rand = "0.7.3"
+
+# Encryption and checksums
+openssl = "0.10.29"
+crc = "1.8.1"
