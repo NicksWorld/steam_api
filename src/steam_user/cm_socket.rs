@@ -1,8 +1,82 @@
 use std::net::{SocketAddr, TcpStream};
 
+use std::io::Cursor;
 use std::io::{Read, Write};
 
 use std::convert::TryInto;
+
+pub struct CMReader {
+    cursor: Cursor<Vec<u8>>,
+}
+
+impl CMReader {
+    pub fn byte(&mut self) -> Result<u8, Box<dyn std::error::Error>> {
+        let mut buf = [0; 1];
+        self.cursor.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    pub fn bytes(&mut self, num: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut bytes = vec![];
+        for _ in 0..num {
+            bytes.push(self.byte()?);
+        }
+        Ok(bytes)
+    }
+
+    pub fn uint32(&mut self) -> Result<u32, Box<dyn std::error::Error>> {
+        let mut buf = [0; 4];
+        self.cursor.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf.try_into()?))
+    }
+
+    pub fn uint64(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut buf = [0; 8];
+        self.cursor.read_exact(&mut buf)?;
+        Ok(u64::from_le_bytes(buf.try_into()?))
+    }
+
+    pub fn new(inner: Vec<u8>) -> CMReader {
+        CMReader {
+            cursor: Cursor::new(inner),
+        }
+    }
+}
+
+pub struct CMWriter {
+    inner: Vec<u8>,
+}
+
+impl CMWriter {
+    pub fn bytes(&mut self, bytes: &[u8]) -> &mut CMWriter {
+        self.inner.extend(bytes);
+        self
+    }
+
+    pub fn uint32(&mut self, int: u32) -> &mut CMWriter {
+        self.bytes(&int.to_le_bytes());
+        self
+    }
+
+    pub fn uint64(&mut self, int: u64) -> &mut CMWriter {
+        self.bytes(&int.to_le_bytes());
+        self
+    }
+
+    pub fn get_inner(&self) -> Vec<u8> {
+        self.inner.clone()
+    }
+
+    pub fn with_size(size: usize) -> CMWriter {
+        CMWriter {
+            inner: Vec::with_capacity(size),
+        }
+    }
+
+    pub fn new() -> CMWriter {
+        CMWriter { inner: vec![] }
+    }
+}
 
 pub struct CMSocket {
     addr: SocketAddr,
@@ -13,6 +87,25 @@ impl CMSocket {
         Ok(CMSocket {
             addr: addr.parse()?,
         })
+    }
+
+    fn send_message(
+        socket: &mut TcpStream,
+        response_header: &[u8],
+        response_body: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        socket.write_all(
+            &[
+                &(response_body.len() as u32 + response_header.len() as u32).to_le_bytes()
+                    as &[u8],
+                "VT01".as_bytes(),
+                response_header,
+                response_body,
+            ]
+            .concat(),
+        )?;
+
+        Ok(())
     }
 
     pub fn start_listener(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -39,58 +132,52 @@ impl CMSocket {
                 }
             } else {
                 // Fetch the data
-                let data: Vec<u8> = socket
-                    .bytes()
-                    .take(message_length.unwrap() as usize)
-                    .map(|x| x.unwrap()) // I hate this, but this will have to do
-                    .collect();
+                let mut data: CMReader = CMReader::new(
+                    socket
+                        .bytes()
+                        .take(message_length.unwrap() as usize)
+                        .map(|x| x.unwrap()) // I hate this, but this will have to do
+                        .collect(),
+                );
 
-                let kind = u32::from_le_bytes(data[0..4].try_into()?) & !0x80000000;
+                let kind = data.uint32()? & !0x80000000;
 
                 match kind {
                     1303 => {
                         // Channel encrypt request
-                        let target_job_id = u64::from_le_bytes(data[4..12].try_into()?);
-                        let source_job_id = u64::from_le_bytes(data[12..20].try_into()?);
-                        println!("{}, {}", target_job_id, source_job_id);
+                        let target_job_id = data.uint64()?;
+                        let source_job_id = data.uint64()?;
+                        println!("Target: {}, Source: {}", target_job_id, source_job_id);
 
-                        let protocol = u32::from_le_bytes(data[20..24].try_into()?);
-                        let universe = u32::from_le_bytes(data[24..28].try_into()?);
-                        let nonce = &data[28..44]; // Used to build the crypto key
+                        let protocol = data.uint32()?;
+                        let universe = data.uint32()?;
+                        let nonce = &data.bytes(16)? as &[u8]; // Used to build the crypto key
 
-                        println!("Proto: {}", protocol);
+                        println!("Protocol: {}", protocol);
                         println!("Universe: {}", universe);
 
                         let session_key =
                             crate::steam_crypto::SessionKey::generate(nonce.try_into()?)?;
 
-                        let mut response: Vec<u8> = vec![];
-                        response.extend(&protocol.to_le_bytes());
-                        response.extend(&(session_key.encrypted.len() as u32).to_le_bytes());
-                        response.extend(&session_key.encrypted);
-                        response.extend(
-                            &(crc::crc32::checksum_ieee(&session_key.encrypted) as u32)
-                                .to_le_bytes(),
-                        );
-                        response.extend(&(0 as u32).to_le_bytes());
+                        let response_body =
+                            CMWriter::with_size(4 + 4 + session_key.encrypted.len() + 4 + 4)
+                                .uint32(protocol)
+                                .uint32(session_key.encrypted.len() as u32)
+                                .bytes(&session_key.encrypted)
+                                .uint32(crc::crc32::checksum_ieee(&session_key.encrypted) as u32)
+                                .uint32(0)
+                                .get_inner();
 
                         const JOBID_NONE: u64 = 18446744073709551615;
-                        // Send with emsg ChannelEncryptResponse
-                        let mut response_header: Vec<u8> = vec![];
-                        response_header.extend(&(1304 as u32).to_le_bytes());
-                        response_header.extend(&JOBID_NONE.to_le_bytes());
-                        response_header.extend(&JOBID_NONE.to_le_bytes());
 
-                        socket.write_all(
-                            &[
-                                &(response.len() as u32 + response_header.len() as u32)
-                                    .to_le_bytes() as &[u8],
-                                "VT01".as_bytes(),
-                                &response_header,
-                                &response,
-                            ]
-                            .concat(),
-                        )?;
+                        let response_header = CMWriter::with_size(4 + 8 + 8)
+                            .uint32(1304)
+                            .uint64(JOBID_NONE)
+                            .uint64(JOBID_NONE)
+                            .get_inner();
+
+                        // Send the message
+                        CMSocket::send_message(socket, &response_header, &response_body)?;
                     }
                     _ => println!("Recieved {}", kind),
                 }
