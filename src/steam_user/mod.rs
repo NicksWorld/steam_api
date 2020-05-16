@@ -60,7 +60,7 @@ impl SteamUser {
     pub fn login(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Decide on a CM Host for the connection, pinging servers is likely smarter.
         let cm_list = SteamUser::get_cmlist()?;
-        let cm_host = &cm_list.serverlist[0];
+        let cm_host = &cm_list.serverlist[1];
         println!("Host: {}", cm_host);
 
         let mut listener = CMSocket::new(cm_host)?;
